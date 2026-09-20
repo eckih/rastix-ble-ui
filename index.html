@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+  <title>Rastix BLE v5</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #111; color: #eee;
+      font-family: system-ui, sans-serif; user-select: none; touch-action: none; }
+    .page { height: 100%; padding: 10px 12px; max-width: 480px; margin: 0 auto;
+      display: flex; flex-direction: column; gap: 8px; }
+    h1 { font-size: 1.1rem; margin: 0; font-weight: 650; }
+    .status { padding: 8px 10px; border-radius: 10px; background: #1c1c1c; font-size: 13px; }
+    .status.on { background: #16351c; }
+    .status.warn { background: #3a2a12; }
+    .bars { display: grid; gap: 6px; }
+    .row { display: grid; grid-template-columns: 72px 1fr 40px; gap: 8px; align-items: center; font-size: 13px; }
+    .track { height: 10px; background: #2a2a2a; border-radius: 99px; overflow: hidden; position: relative; }
+    .track.center::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; background: #666; }
+    .fill { height: 100%; width: 0; background: #3aa0ff; }
+    .fill.steer { position: absolute; top: 0; bottom: 0; width: 10px; margin-left: -5px;
+      left: 50%; border-radius: 99px; background: #ff9800; }
+    .go, .ble, .tilt { width: 100%; padding: 12px; border: 0; border-radius: 12px; font-size: 16px; font-weight: 700; color: #fff; }
+    .ble { background: #5e35b1; }
+    .go { background: #1e88e5; }
+    .go.stop { background: #c62828; }
+    .tilt { background: #455a64; }
+    .tilt.on { background: #00897b; }
+    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .test { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .sens { margin: 0; font-size: 12px; }
+    .pad-wrap { display: flex; justify-content: center; align-items: center; flex: 1; min-height: 0; }
+    canvas { width: min(200px, 42vh); height: min(200px, 42vh); background: #1a1a1a; border-radius: 50%; touch-action: none; }
+    .opts { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; }
+    label { display: flex; gap: 6px; align-items: center; }
+    input[type=range] { width: 100%; touch-action: auto; }
+    .dbg { opacity: .55; font-size: 11px; font-variant-numeric: tabular-nums; }
+    .hint { font-size: 11px; color: #9aa; line-height: 1.35; }
+  </style>
+</head>
+<body>
+<script>
+(function () {
+  /** Nordic UART Service / RX (write from phone → ESP) */
+  const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+  const NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+  const NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+  const MAX_TILT = 32;
+  const DEADZONE = 10;
+  const ANGLE_SMOOTH = 0.12;
+  const OUT_SMOOTH = 0.18;
+  const OUT_SMOOTH_STOP = 0.45;
+  const STEP = 4;
+  const SEND_MS = 120;
+  const MAX_OUT_DELTA = 10;
+  const PAD_DEAD = 0.15;
+
+  // === RICHTUNG / LAGE Defaults (Checkbox + localStorage) ===
+  // invertY false = neue Basis (umgekehrt zur alten App); true = nochmal tauschen
+  const DEF_INVERT_Y = false;
+  const DEF_INVERT_X = false;
+  const DEF_LANDSCAPE = false;
+
+  let device = null;
+  let rxChar = null;
+  let txChar = null;
+  let connected = false;
+  let active = false;
+  let cal = { beta: null, gamma: null };
+  let calibrateNext = false;
+  let invertY = DEF_INVERT_Y;
+  let invertX = DEF_INVERT_X;
+  let swapAxes = false;
+  let landscape = DEF_LANDSCAPE;
+  let speed = 0;
+  let steering = 0;
+  let touchActive = false;
+  let lastSent = { speed: 0, steering: 0, t: 0 };
+  let heartbeat = null;
+  let encoder = new TextEncoder();
+  let writeQueue = Promise.resolve();
+  let pendingDrive = null;
+  let maxSpdTimer = null;
+  let filtAngle = { beta: null, gamma: null };
+  let filtOut = { speed: 0, steering: 0 };
+
+  function loadUiPrefs() {
+    try {
+      const j = JSON.parse(localStorage.getItem("rastix_ui") || "{}");
+      if (typeof j.invertY === "boolean") invertY = j.invertY;
+      if (typeof j.invertX === "boolean") invertX = j.invertX;
+      if (typeof j.swapAxes === "boolean") swapAxes = j.swapAxes;
+      if (typeof j.landscape === "boolean") landscape = j.landscape;
+    } catch (e) {}
+  }
+  function saveUiPrefs() {
+    try {
+      localStorage.setItem("rastix_ui", JSON.stringify({ invertY, invertX, swapAxes, landscape }));
+    } catch (e) {}
+  }
+  loadUiPrefs();
+
+  if (!navigator.bluetooth) {
+    const https = window.isSecureContext;
+    const proto = location.protocol;
+    const host = location.host || "(kein Host)";
+    document.body.innerHTML =
+      '<div style="padding:1rem;font-family:system-ui;line-height:1.45;max-width:28rem">' +
+      "<h1 style=\"font-size:1.1rem\">Web Bluetooth fehlt</h1>" +
+      "<p>Aktuell: <code>" + proto + "//" + host + "</code><br>" +
+      "Secure context: <b>" + (https ? "ja" : "nein") + "</b></p>" +
+      "<p><b>So geht’s mit Handy-Chrome:</b></p>" +
+      "<ol>" +
+      "<li>Nur <b>Chrome</b> oder <b>Edge</b> (nicht Firefox / Samsung Internet).</li>" +
+      "<li>Seite über <b>HTTPS</b> öffnen — oder lokal per Flag:</li>" +
+      "</ol>" +
+      "<p>In der Adresszeile:<br><code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code></p>" +
+      "<p>Dort exakt eintragen (deine PC-IP):<br>" +
+      "<code>http://192.168.178.XX:8080</code><br>" +
+      "→ Enabled → Chrome <b>neu starten</b> → dieselbe URL öffnen.</p>" +
+      "<p>Ohne Web-UI: App „nRF Connect“ / Serial Bluetooth Terminal (BLE).</p>" +
+      "</div>";
+    return;
+  }
+
+  document.body.innerHTML = `
+    <div class="page">
+      <h1>Rastix BLE v6</h1>
+      <div class="status" id="st">Nicht verbunden</div>
+      <button class="ble" id="ble">BLE verbinden</button>
+      <p class="hint">Gerät „rastix-v1“ wählen. Gyro braucht <b>HTTPS</b>. Lage: Hochkant oder Quer (Button).</p>
+      <div class="bars">
+        <div class="row"><span>Gas</span><div class="track"><div class="fill" id="spd"></div></div><span id="spdt">0</span></div>
+        <div class="row"><span>Lenkung</span><div class="track center"><div class="fill steer" id="str"></div></div><span id="strt">0</span></div>
+      </div>
+      <div class="row2">
+        <button class="go" id="btn" disabled>Start</button>
+        <button class="tilt" id="tiltbtn" type="button">Neigung: Aus</button>
+      </div>
+      <button class="tilt" id="orientbtn" type="button">Lage: Hochkant</button>
+      <div class="test">
+        <div class="sens"><div><span id="pwmRlab">PWM R</span>: <span id="g14v">0</span>%</div>
+          <input type="range" id="g14" min="0" max="100" value="0" disabled></div>
+        <div class="sens"><div><span id="pwmLlab">PWM L</span>: <span id="g13v">0</span>%</div>
+          <input type="range" id="g13" min="0" max="100" value="0" disabled></div>
+      </div>
+      <div class="pad-wrap"><canvas id="pad" width="240" height="240"></canvas></div>
+      <div class="opts">
+        <label><input type="checkbox" id="invy"> Vor/Zurück tauschen</label>
+        <label><input type="checkbox" id="invx"> Links/Rechts tauschen</label>
+        <label><input type="checkbox" id="swapax"> Achsen tauschen (Gas↔Lenkung)</label>
+      </div>
+      <div class="sens">
+        <div>Max-Geschwindigkeit: <span id="maxv">50</span>%</div>
+        <input type="range" id="maxspd" min="5" max="100" step="1" value="50" disabled>
+      </div>
+      <div class="sens">
+        <div>Anlauf-PWM: <span id="minv">12</span>%</div>
+        <input type="range" id="minspd" min="0" max="40" step="1" value="12" disabled>
+      </div>
+      <div class="sens">
+        <div>Lenk-Empfindlichkeit: <span id="sensv">10</span>%</div>
+        <input type="range" id="sens" min="0" max="100" step="0.5" value="10" disabled>
+      </div>
+      <div class="dbg" id="dbg">Sensor: —</div>
+    </div>`;
+
+  const ui = {
+    st: document.getElementById("st"),
+    ble: document.getElementById("ble"),
+    spd: document.getElementById("spd"),
+    str: document.getElementById("str"),
+    spdt: document.getElementById("spdt"),
+    strt: document.getElementById("strt"),
+    btn: document.getElementById("btn"),
+    tiltbtn: document.getElementById("tiltbtn"),
+    orientbtn: document.getElementById("orientbtn"),
+    pad: document.getElementById("pad"),
+    invy: document.getElementById("invy"),
+    invx: document.getElementById("invx"),
+    swapax: document.getElementById("swapax"),
+    sens: document.getElementById("sens"),
+    sensv: document.getElementById("sensv"),
+    maxspd: document.getElementById("maxspd"),
+    maxv: document.getElementById("maxv"),
+    minspd: document.getElementById("minspd"),
+    minv: document.getElementById("minv"),
+    dbg: document.getElementById("dbg"),
+    g14: document.getElementById("g14"),
+    g14v: document.getElementById("g14v"),
+    g13: document.getElementById("g13"),
+    g13v: document.getElementById("g13v"),
+    pwmRlab: document.getElementById("pwmRlab"),
+    pwmLlab: document.getElementById("pwmLlab"),
+  };
+
+  // PWM-Pins vom ESP (cfg pr=/pl=) — keine falschen Defaults anzeigen
+  let pwmPinR = null;
+  let pwmPinL = null;
+
+  function setPwmPinLabels() {
+    if (ui.pwmRlab)
+      ui.pwmRlab.textContent = pwmPinR != null ? ("PWM R GPIO" + pwmPinR) : "PWM R (warte auf ESP)";
+    if (ui.pwmLlab)
+      ui.pwmLlab.textContent = pwmPinL != null ? ("PWM L GPIO" + pwmPinL) : "PWM L (warte auf ESP)";
+  }
+  setPwmPinLabels();
+
+  let sensorHits = 0, gotOrient = false, tiltReady = false, sensorWatch = null;
+  let sensorAlive = false;
+  let orientSensor = null;
+  let tiltEnabled = false; // Default: Neigung aus — nur Joystick
+
+  function sensorDiag() {
+    const https = window.isSecureContext;
+    const hasOrient = typeof window.DeviceOrientationEvent !== "undefined";
+    const hasMotion = typeof window.DeviceMotionEvent !== "undefined";
+    return { https, hasOrient, hasMotion };
+  }
+
+  function onProbeOrient(ev) {
+    if (ev.beta == null || ev.gamma == null) return;
+    sensorAlive = true;
+    sensorHits += 1;
+    if (!active)
+      ui.dbg.textContent = "Sensor lage: nick " + ev.beta.toFixed(0) + "°  roll " + ev.gamma.toFixed(0) + "°";
+  }
+
+  function onProbeMotion(ev) {
+    if (sensorAlive && gotOrient) return;
+    const g = ev.accelerationIncludingGravity;
+    if (!g || g.x == null) return;
+    sensorAlive = true;
+    sensorHits += 1;
+    if (!active) {
+      const pitch = Math.atan2(-g.z, Math.hypot(g.x, g.y)) * (180 / Math.PI);
+      const roll = Math.atan2(g.x, g.y) * (180 / Math.PI);
+      ui.dbg.textContent = "Sensor beschl: nick " + pitch.toFixed(0) + "°  roll " + roll.toFixed(0) + "°";
+    }
+  }
+
+  function startSensorProbe() {
+    window.addEventListener("deviceorientation", onProbeOrient, true);
+    window.addEventListener("deviceorientationabsolute", onProbeOrient, true);
+    window.addEventListener("devicemotion", onProbeMotion, true);
+    // Generic Sensor API nur als Anzeige/Probe — nicht zum Fahren (andere Winkel-Konvention)
+    try {
+      if ("AbsoluteOrientationSensor" in window) {
+        orientSensor = new AbsoluteOrientationSensor({ frequency: 20 });
+        orientSensor.addEventListener("reading", () => {
+          sensorAlive = true;
+          sensorHits += 1;
+        });
+        orientSensor.addEventListener("error", () => {});
+        Promise.resolve(orientSensor.start()).catch(() => {});
+      }
+    } catch (e) {}
+
+    const d = sensorDiag();
+    if (!d.https) {
+      ui.dbg.textContent = "Kein sicherer Kontext (kein HTTPS) — Chrome blockiert Sensoren";
+      setStatus("Seite braucht HTTPS für Gyro", "warn");
+    } else {
+      ui.dbg.textContent = "Sensor: warte auf Events… (Handy leicht bewegen)";
+    }
+    setTimeout(() => {
+      if (sensorAlive) return;
+      if (!d.https)
+        ui.dbg.textContent = "Sensor blockiert: Seite nicht über HTTPS";
+      else
+        ui.dbg.textContent = "Sensor: keine Events — Chrome → Schloss → Bewegungssensoren → Zulassen";
+    }, 2500);
+  }
+
+  function gyroHint() {
+    const d = sensorDiag();
+    if (!d.https)
+      return "Kein Gyro: Seite nicht HTTPS (Chrome blockiert Sensoren)";
+    return "Kein Gyro — Schloss in Adresszeile → Bewegungssensoren → Zulassen";
+  }
+
+  function updateTiltButton() {
+    ui.tiltbtn.textContent = tiltEnabled ? "Neigung: An" : "Neigung: Aus";
+    ui.tiltbtn.classList.toggle("on", tiltEnabled);
+  }
+
+  function attachTiltListeners() {
+    window.addEventListener("deviceorientation", onOrient, true);
+    window.addEventListener("deviceorientationabsolute", onOrient, true);
+    // devicemotion erst als Fallback, wenn keine Lage-Events kommen
+  }
+
+  function detachTiltListeners() {
+    window.removeEventListener("deviceorientation", onOrient, true);
+    window.removeEventListener("deviceorientationabsolute", onOrient, true);
+    window.removeEventListener("devicemotion", onMotion, true);
+    if (sensorWatch) {
+      clearTimeout(sensorWatch);
+      sensorWatch = null;
+    }
+  }
+
+  async function beginTiltControl() {
+    if (!active || !tiltEnabled) return;
+    const ok = await askSensorPermission();
+    // Frische Kalibrierung erzwingen — alte Neutralwerte nicht weiterverwenden
+    calibrateNext = true;
+    tiltReady = false;
+    gotOrient = false;
+    cal = { beta: null, gamma: null };
+    filtAngle = { beta: null, gamma: null };
+    filtOut = { speed: 0, steering: 0 };
+    apply(0, 0);
+    attachTiltListeners();
+
+    if (!window.isSecureContext) {
+      setStatus(gyroHint(), "warn");
+      return;
+    }
+    if (!ok) {
+      setStatus("Sensor-Erlaubnis verweigert — Joystick nutzen", "warn");
+      return;
+    }
+    setStatus("Neutral halten — kalibriere…", "on");
+    if (sensorWatch) clearTimeout(sensorWatch);
+    // Nach 1,2 s ohne Lage-Sensor: Beschleunigung als Fallback
+    sensorWatch = setTimeout(() => {
+      if (!active || !tiltEnabled) return;
+      if (tiltReady) return;
+      if (gotOrient) {
+        setStatus(gyroHint(), "warn");
+        return;
+      }
+      window.addEventListener("devicemotion", onMotion, true);
+      setStatus("Lage-Sensor fehlt — Beschleunigung, Neutral halten…", "warn");
+      sensorWatch = setTimeout(() => {
+        if (!active || !tiltEnabled || tiltReady) return;
+        setStatus(gyroHint(), "warn");
+      }, 2000);
+    }, 1200);
+  }
+
+  function stopTiltControl(keepActive) {
+    detachTiltListeners();
+    tiltReady = false;
+    calibrateNext = false;
+    cal = { beta: null, gamma: null };
+    filtAngle = { beta: null, gamma: null };
+    filtOut = { speed: 0, steering: 0 };
+    if (keepActive && active) {
+      speed = 0;
+      steering = 0;
+      updateBars();
+      send(true);
+      setStatus("Neigung aus — Joystick nutzen", "on");
+    }
+  }
+
+  async function toggleTilt() {
+    tiltEnabled = !tiltEnabled;
+    updateTiltButton();
+    if (!active) {
+      setStatus(tiltEnabled ? "Neigung an — nach Start kalibrieren" : "Neigung aus — Joystick");
+      return;
+    }
+    if (tiltEnabled) {
+      await beginTiltControl();
+    } else {
+      stopTiltControl(true);
+    }
+  }
+
+  function setStatus(text, cls) {
+    ui.st.textContent = text;
+    ui.st.className = "status" + (cls ? " " + cls : "");
+  }
+
+  function setConnected(on) {
+    connected = on;
+    ui.btn.disabled = !on;
+    ui.g14.disabled = !on;
+    ui.g13.disabled = !on;
+    ui.sens.disabled = !on;
+    ui.maxspd.disabled = !on;
+    ui.minspd.disabled = !on;
+    ui.ble.textContent = on ? "BLE trennen" : "BLE verbinden";
+  }
+
+  async function bleWrite(line) {
+    if (!rxChar) return;
+    writeQueue = writeQueue.then(async () => {
+      if (!rxChar) return;
+      const data = encoder.encode(line + "\n");
+      try {
+        await rxChar.writeValueWithoutResponse(data);
+      } catch (e) {
+        try {
+          await rxChar.writeValue(data);
+        } catch (e2) {
+          console.warn(e2);
+          setStatus("BLE-Schreiben fehlgeschlagen", "warn");
+        }
+      }
+      // Kleine Pause: Android/WebBluetooth braucht Abstand zwischen Writes
+      await new Promise((r) => setTimeout(r, 20));
+    }).catch(() => {});
+    return writeQueue;
+  }
+
+  function bleWriteDrive(spd, str) {
+    // Immer nur den neuesten Drive-Wert senden (Neigung sonst überholt sich)
+    pendingDrive = spd + "," + str;
+    writeQueue = writeQueue.then(async () => {
+      if (!rxChar || pendingDrive == null) return;
+      const line = pendingDrive;
+      pendingDrive = null;
+      const data = encoder.encode(line + "\n");
+      try {
+        await rxChar.writeValueWithoutResponse(data);
+      } catch (e) {
+        try {
+          await rxChar.writeValue(data);
+        } catch (e2) {
+          console.warn(e2);
+        }
+      }
+      await new Promise((r) => setTimeout(r, 25));
+      // Falls während des Schreibens neuere Werte kamen: nochmal
+      if (pendingDrive != null) {
+        const again = pendingDrive;
+        pendingDrive = null;
+        const d2 = encoder.encode(again + "\n");
+        try {
+          await rxChar.writeValueWithoutResponse(d2);
+        } catch (e) {
+          try { await rxChar.writeValue(d2); } catch (_) {}
+        }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    }).catch(() => {});
+  }
+
+  async function connectBle() {
+    if (connected) {
+      if (device && device.gatt.connected) device.gatt.disconnect();
+      cleanupBle();
+      return;
+    }
+    try {
+      setStatus("Gerät wählen…");
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: "rastix" }, { services: [NUS_SERVICE] }],
+        optionalServices: [NUS_SERVICE],
+      });
+      device.addEventListener("gattserverdisconnected", () => {
+        cleanupBle();
+        setStatus("BLE getrennt", "warn");
+      });
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(NUS_SERVICE);
+      rxChar = await service.getCharacteristic(NUS_RX);
+      try {
+        txChar = await service.getCharacteristic(NUS_TX);
+        await txChar.startNotifications();
+        txChar.addEventListener("characteristicvaluechanged", onBleNotify);
+      } catch (e) {
+        console.warn("TX notify nicht verfügbar", e);
+        txChar = null;
+      }
+      setConnected(true);
+      setStatus("BLE verbunden — Config laden…", "on");
+      await bleWrite("g");
+      await bleWrite("h,1");
+      // ESP sendet cfg auch on_connect (~500ms) — nochmals anfordern
+      setTimeout(() => { if (connected) bleWrite("g"); }, 800);
+    } catch (e) {
+      console.warn(e);
+      cleanupBle();
+      setStatus("Verbindung abgebrochen: " + (e.message || e), "warn");
+    }
+  }
+
+  let ignoreCfgUntil = 0;
+
+  function applyEspConfig(text) {
+    // cfg,m=50,f=10.0,pr=19,pl=25
+    const t = String(text || "").trim();
+    if (t.indexOf("cfg,") !== 0) return false;
+    const skipMf = Date.now() < ignoreCfgUntil;
+    const parts = t.slice(4).split(",");
+    let msg = [];
+    for (let i = 0; i < parts.length; i++) {
+      const kv = parts[i].split("=");
+      if (kv.length !== 2) continue;
+      const key = kv[0].trim().toLowerCase();
+      const val = Number(kv[1]);
+      if (Number.isNaN(val)) continue;
+      if (key === "m" && ui.maxspd && !skipMf) {
+        ui.maxspd.value = val;
+        ui.maxv.textContent = String(val);
+        msg.push("Max " + val + "%");
+      } else if (key === "f" && ui.sens && !skipMf) {
+        ui.sens.value = val;
+        ui.sensv.textContent = String(val);
+        msg.push("Lenk " + val + "%");
+      } else if (key === "pr") {
+        pwmPinR = Math.round(val);
+        setPwmPinLabels();
+        msg.push("PWM-R GPIO" + pwmPinR);
+      } else if (key === "pl") {
+        pwmPinL = Math.round(val);
+        setPwmPinLabels();
+        msg.push("PWM-L GPIO" + pwmPinL);
+      }
+    }
+    if (msg.length)
+      setStatus("ESP: " + msg.join(", ") + " — Start drücken", "on");
+    return true;
+  }
+
+  function onBleNotify(ev) {
+    try {
+      const text = new TextDecoder("utf-8").decode(ev.target.value);
+      if (applyEspConfig(text)) return;
+      console.log("BLE TX:", text);
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+
+  function cleanupBle() {
+    if (active) haltDrive(true);
+    if (txChar) {
+      try {
+        txChar.removeEventListener("characteristicvaluechanged", onBleNotify);
+        txChar.stopNotifications().catch(() => {});
+      } catch (e) {}
+    }
+    device = null;
+    rxChar = null;
+    txChar = null;
+    setConnected(false);
+  }
+
+  function updateBars() {
+    ui.spd.style.width = Math.abs(speed) + "%";
+    ui.spdt.textContent = String(speed);
+    ui.str.style.left = ((steering + 100) / 2) + "%";
+    ui.strt.textContent = String(steering);
+  }
+
+  function quantize(v) {
+    return Math.round(v / STEP) * STEP;
+  }
+
+  function apply(nextSpeed, nextSteering) {
+    let s = clamp(quantize(nextSpeed), -100, 100);
+    let t = clamp(quantize(nextSteering), -100, 100);
+    // Vorzeichenwechsel (Vor ↔ Zurück): sofort, kein Slew
+    const signFlip = (speed !== 0 && s !== 0 && Math.sign(speed) !== Math.sign(s));
+    if (!signFlip && Math.abs(s) > Math.abs(speed)) {
+      const cap = Math.abs(speed) + MAX_OUT_DELTA;
+      if (Math.abs(s) > cap) s = (s < 0 ? -1 : 1) * cap;
+    }
+    if (Math.abs(t - steering) > MAX_OUT_DELTA)
+      t = steering + Math.sign(t - steering) * MAX_OUT_DELTA;
+    const wasMoving = speed !== 0 || steering !== 0;
+    const becameRev = speed >= 0 && s < 0;
+    speed = s;
+    steering = t;
+    updateBars();
+    send((wasMoving && speed === 0 && steering === 0) || becameRev || signFlip);
+  }
+
+  function send(force) {
+    if (!active && !force) return;
+    if (!connected) return;
+    const now = Date.now();
+    const same = speed === lastSent.speed && steering === lastSent.steering;
+    if (!force) {
+      if (same) return;
+      if (now - lastSent.t < SEND_MS) return;
+    } else if (same && now - lastSent.t < SEND_MS) {
+      return;
+    }
+    lastSent = { speed, steering, t: now };
+    bleWriteDrive(speed, steering);
+  }
+
+  async function start() {
+    if (!connected) return;
+    calibrateNext = false;
+    tiltReady = false;
+    gotOrient = false;
+    active = true;
+    speed = 0;
+    steering = 0;
+    filtAngle = { beta: null, gamma: null };
+    filtOut = { speed: 0, steering: 0 };
+    updateBars();
+    lastSent = { speed: 0, steering: 0, t: 0 };
+    ui.btn.textContent = "Stopp";
+    ui.btn.classList.add("stop");
+    await bleWrite("h,1");
+    document.addEventListener("visibilitychange", onVis);
+    heartbeat = setInterval(() => {
+      if (!active || !connected) return;
+      lastSent.t = 0;
+      send(true);
+    }, 500);
+
+    if (tiltEnabled) {
+      await beginTiltControl();
+    } else {
+      setStatus("Fahrt aktiv — Joystick (Neigung aus)", "on");
+    }
+  }
+
+  function haltDrive(skipCmd) {
+    if (!active && skipCmd) return;
+    active = false;
+    touchActive = false;
+    stopTiltControl(false);
+    document.removeEventListener("visibilitychange", onVis);
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+    ui.btn.textContent = "Start";
+    ui.btn.classList.remove("stop");
+    speed = 0;
+    steering = 0;
+    updateBars();
+    drawPad(ui.pad.getContext("2d"), 0, 0, false);
+    if (!skipCmd && connected) bleWrite("stop");
+  }
+
+  function stop(reason) {
+    haltDrive(false);
+    setStatus(reason || "Gestoppt");
+  }
+
+  function onVis() {
+    if (document.hidden) stop("Display aus");
+  }
+
+  function onOrient(ev) {
+    if (ev.beta == null || ev.gamma == null) return;
+    gotOrient = true;
+    useTilt(ev.beta, ev.gamma, "lage");
+  }
+
+  function onMotion(ev) {
+    if (gotOrient) return;
+    const g = ev.accelerationIncludingGravity;
+    if (!g || g.x == null) return;
+    const pitch = Math.atan2(-g.z, Math.hypot(g.x, g.y)) * (180 / Math.PI);
+    const roll = Math.atan2(g.x, g.y) * (180 / Math.PI);
+    useTilt(pitch, roll, "beschl");
+  }
+
+  function useTilt(beta, gamma, src) {
+    if (!active || !tiltEnabled || touchActive) return;
+    if (src === "beschl" && gotOrient) return;
+    sensorAlive = true;
+    sensorHits += 1;
+
+    // Beim Einschalten: ersten Rohwert sofort als Neutral nehmen (kein alter Filter)
+    if (calibrateNext || cal.beta == null || !tiltReady) {
+      cal.beta = beta;
+      cal.gamma = gamma;
+      filtAngle.beta = beta;
+      filtAngle.gamma = gamma;
+      calibrateNext = false;
+      tiltReady = true;
+      filtOut = { speed: 0, steering: 0 };
+      apply(0, 0);
+      setStatus("Neutral kalibriert — jetzt neigen", "on");
+      ui.dbg.textContent =
+        "Kalibriert @ nick " + beta.toFixed(0) + "°  roll " + gamma.toFixed(0) + "° (" + src + ")";
+      return;
+    }
+
+    filtAngle.beta += ANGLE_SMOOTH * (beta - filtAngle.beta);
+    filtAngle.gamma += ANGLE_SMOOTH * (gamma - filtAngle.gamma);
+
+    // Hochkant: Nick=beta → Gas, Roll=gamma → Lenk
+    // Quer: Achsen getauscht (Handy quer halten)
+    let dPitch, dRoll;
+    if (landscape) {
+      // Quer: Gas-Achse gegenüber Hochkant-Logik umgekehrt
+      dPitch = -(filtAngle.gamma - cal.gamma);
+      dRoll = filtAngle.beta - cal.beta;
+    } else {
+      dPitch = filtAngle.beta - cal.beta;
+      dRoll = filtAngle.gamma - cal.gamma;
+    }
+    if (swapAxes) {
+      const t = dPitch;
+      dPitch = dRoll;
+      dRoll = t;
+    }
+    // invertY: Checkbox an = tauschen (Default DEF_INVERT_Y bereits geladen)
+    if (invertY) dPitch = -dPitch;
+    if (invertX) dRoll = -dRoll;
+
+    const targetSpd = mapThrottle(dPitch);
+    const targetStr = mapAxis(dRoll, true);
+
+    ui.dbg.textContent =
+      (landscape ? "Quer " : "Hochkant ") +
+      "Δgas " + dPitch.toFixed(0) + "° → " + Math.round(targetSpd) +
+      " | Δlenk " + dRoll.toFixed(0) + "° → " + Math.round(targetStr);
+
+    const towardZero = Math.abs(targetSpd) < Math.abs(filtOut.speed);
+    const kSpd = towardZero ? OUT_SMOOTH_STOP : OUT_SMOOTH;
+    filtOut.speed += kSpd * (targetSpd - filtOut.speed);
+    filtOut.steering += OUT_SMOOTH * (targetStr - filtOut.steering);
+    // Nur bei Ziel≈0 snappen — sonst bleibt Rückwärts/leichtes Gas bei |filt|<8 hängen
+    if (targetSpd === 0) filtOut.speed = 0;
+    else if (Math.abs(targetSpd) < 8 && Math.abs(filtOut.speed) < 8) filtOut.speed = 0;
+    if (targetStr === 0 && Math.abs(filtOut.steering) < STEP * 0.6) filtOut.steering = 0;
+    apply(filtOut.speed, filtOut.steering);
+  }
+
+  function mapThrottle(deg) {
+    const mag = Math.abs(deg);
+    if (mag < DEADZONE) return 0;
+    const val = Math.max(0, Math.min(100, ((mag - DEADZONE) / (MAX_TILT - DEADZONE)) * 100));
+    // positiv = vorwärts, negativ = rückwärts (DIR LOW am ZS-X11H)
+    return deg >= 0 ? val : -val;
+  }
+
+  async function askSensorPermission() {
+    const ask = async (obj) => {
+      if (!obj || typeof obj.requestPermission !== "function") return true;
+      try {
+        return (await obj.requestPermission()) === "granted";
+      } catch (e) {
+        return false;
+      }
+    };
+    const okOrient = await ask(window.DeviceOrientationEvent);
+    const okMotion = await ask(window.DeviceMotionEvent);
+    return okOrient || okMotion;
+  }
+
+  function setupPad(canvas) {
+    const ctx = canvas.getContext("2d");
+    const toLocal = (ev) => {
+      const r = canvas.getBoundingClientRect();
+      const t = ev.touches ? ev.touches[0] : ev;
+      const x = ((t.clientX - r.left) / r.width) * 2 - 1;
+      const y = ((t.clientY - r.top) / r.height) * 2 - 1;
+      return { x: clamp(x, -1, 1), y: clamp(y, -1, 1) };
+    };
+    const handle = (ev) => {
+      ev.preventDefault();
+      if (!active) return;
+      touchActive = true;
+      const p = toLocal(ev);
+      let nx = invertX ? -p.x : p.x;
+      let ny = invertY ? -p.y : p.y;
+      // Quer: Pad-Achsen tauschen (rechts = Gas, hoch = Lenk) — optional natürlicher
+      if (landscape) {
+        const t = nx;
+        nx = ny;
+        ny = t;
+      }
+      let sx = nx, sy = ny;
+      if (Math.hypot(sx, sy) < PAD_DEAD) { sx = 0; sy = 0; }
+      drawPad(ctx, p.x, p.y, true);
+      apply(sy * 100, sx * 100);
+    };
+    const end = (ev) => {
+      ev.preventDefault();
+      touchActive = false;
+      drawPad(ctx, 0, 0, false);
+      if (active) apply(0, 0);
+    };
+    canvas.addEventListener("touchstart", handle, { passive: false });
+    canvas.addEventListener("touchmove", handle, { passive: false });
+    canvas.addEventListener("touchend", end, { passive: false });
+    canvas.addEventListener("touchcancel", end, { passive: false });
+    canvas.addEventListener("mousedown", (ev) => {
+      handle(ev);
+      const move = (e) => handle(e);
+      const up = (e) => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        end(e);
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+    });
+  }
+
+  function drawPad(ctx, x, y, down) {
+    const w = ctx.canvas.width, h = ctx.canvas.height, cx = w / 2, cy = h / 2;
+    ctx.clearRect(0, 0, w, h);
+    ctx.beginPath();
+    ctx.arc(cx, cy, w * 0.48, 0, Math.PI * 2);
+    ctx.fillStyle = "#1a1a1a";
+    ctx.fill();
+    ctx.strokeStyle = "#444";
+    ctx.lineWidth = 4;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx + x * w * 0.36, cy + y * h * 0.36, down ? 28 : 22, 0, Math.PI * 2);
+    ctx.fillStyle = down ? "#1e88e5" : "#3a3a3a";
+    ctx.fill();
+  }
+
+  function mapAxis(deg, signed) {
+    const mag = Math.abs(deg);
+    if (mag < DEADZONE) return 0;
+    const val = Math.max(0, Math.min(100, ((mag - DEADZONE) / (MAX_TILT - DEADZONE)) * 100));
+    if (!signed) return deg >= 0 ? val : 0;
+    return deg >= 0 ? val : -val;
+  }
+
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  ui.ble.addEventListener("click", () => connectBle());
+  ui.btn.addEventListener("click", () => {
+    if (active) stop("Manuell gestoppt");
+    else start();
+  });
+  ui.tiltbtn.addEventListener("click", () => { toggleTilt(); });
+  updateTiltButton();
+
+  function updateOrientButton() {
+    ui.orientbtn.textContent = landscape ? "Lage: Quer" : "Lage: Hochkant";
+    ui.orientbtn.classList.toggle("on", landscape);
+  }
+  ui.orientbtn.addEventListener("click", () => {
+    landscape = !landscape;
+    saveUiPrefs();
+    updateOrientButton();
+    calibrateNext = true;
+    filtOut = { speed: 0, steering: 0 };
+    if (active) apply(0, 0);
+    setStatus(landscape ? "Querformat — einmal Neutral halten" : "Hochkant — einmal Neutral halten", "on");
+  });
+  updateOrientButton();
+
+  ui.invy.checked = invertY;
+  ui.invx.checked = invertX;
+  ui.swapax.checked = swapAxes;
+  ui.invy.addEventListener("change", () => { invertY = ui.invy.checked; saveUiPrefs(); });
+  ui.invx.addEventListener("change", () => { invertX = ui.invx.checked; saveUiPrefs(); });
+  ui.swapax.addEventListener("change", () => { swapAxes = ui.swapax.checked; saveUiPrefs(); });
+  let sensTimer = null;
+  ui.sens.addEventListener("input", () => {
+    ui.sensv.textContent = ui.sens.value;
+    ignoreCfgUntil = Date.now() + 2000;
+    clearTimeout(sensTimer);
+    sensTimer = setTimeout(() => {
+      ignoreCfgUntil = Date.now() + 2000;
+      bleWrite("f," + ui.sens.value);
+      setStatus("Lenk-Empfindlichkeit senden: " + ui.sens.value + "%");
+    }, 120);
+  });
+  ui.sens.addEventListener("change", () => {
+    ui.sensv.textContent = ui.sens.value;
+    ignoreCfgUntil = Date.now() + 2000;
+    clearTimeout(sensTimer);
+    bleWrite("f," + ui.sens.value);
+    setStatus("Lenk-Empfindlichkeit senden: " + ui.sens.value + "%");
+  });
+  ui.maxspd.addEventListener("input", () => {
+    ui.maxv.textContent = ui.maxspd.value;
+    ignoreCfgUntil = Date.now() + 2000;
+    clearTimeout(maxSpdTimer);
+    maxSpdTimer = setTimeout(() => {
+      ignoreCfgUntil = Date.now() + 2000;
+      bleWrite("m," + ui.maxspd.value);
+      setStatus("Max-Speed senden: " + ui.maxspd.value + "%");
+    }, 120);
+  });
+  ui.maxspd.addEventListener("change", () => {
+    ui.maxv.textContent = ui.maxspd.value;
+    ignoreCfgUntil = Date.now() + 2000;
+    clearTimeout(maxSpdTimer);
+    bleWrite("m," + ui.maxspd.value);
+    setStatus("Max-Speed senden: " + ui.maxspd.value + "%");
+  });
+  ui.minspd.addEventListener("input", () => { ui.minv.textContent = ui.minspd.value; });
+  ui.minspd.addEventListener("change", () => {
+    bleWrite("n," + ui.minspd.value);
+  });
+
+  function bindPwm(input, label, getPin) {
+    let t = null;
+    input.addEventListener("input", () => {
+      label.textContent = input.value;
+      clearTimeout(t);
+      t = setTimeout(() => {
+        const pin = getPin();
+        if (pin == null) {
+          setStatus("Warte auf Pin-Config vom ESP (nochmals verbinden)", "warn");
+          return;
+        }
+        if (active) haltDrive(true);
+        bleWrite("p" + pin + "," + input.value);
+        setStatus("PWM GPIO" + pin + " " + input.value + "%");
+      }, 40);
+    });
+  }
+  bindPwm(ui.g14, ui.g14v, () => pwmPinR);
+  bindPwm(ui.g13, ui.g13v, () => pwmPinL);
+
+  setupPad(ui.pad);
+  drawPad(ui.pad.getContext("2d"), 0, 0, false);
+  updateBars();
+  startSensorProbe();
+  window.addEventListener("pagehide", () => stop("Seite geschlossen"));
+})();
+</script>
+</body>
+</html>
