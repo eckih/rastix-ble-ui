@@ -153,6 +153,7 @@
         <label><input type="checkbox" id="invy"> Vor/Zurück tauschen</label>
         <label><input type="checkbox" id="invx"> Links/Rechts tauschen</label>
         <label><input type="checkbox" id="swapax"> Achsen tauschen</label>
+        <label><input type="checkbox" id="invl"> Linker Motor umkehren</label>
       </div>
       <div class="sens">
         <div>Max-Geschwindigkeit: <span id="maxv">50</span>%</div>
@@ -179,6 +180,7 @@
     invy: document.getElementById("invy"),
     invx: document.getElementById("invx"),
     swapax: document.getElementById("swapax"),
+    invl: document.getElementById("invl"),
     sens: document.getElementById("sens"),
     sensv: document.getElementById("sensv"),
     maxspd: document.getElementById("maxspd"),
@@ -508,6 +510,9 @@
         pwmPinL = Math.round(val);
         setPwmPinLabels();
         msg.push("PWM-L GPIO" + pwmPinL);
+      } else if (key === "il" && ui.invl) {
+        ui.invl.checked = val >= 0.5;
+        msg.push(ui.invl.checked ? "Motor-L umgekehrt" : "Motor-L normal");
       }
     }
     if (msg.length)
@@ -844,6 +849,16 @@
   ui.invy.addEventListener("change", () => { invertY = ui.invy.checked; saveUiPrefs(); });
   ui.invx.addEventListener("change", () => { invertX = ui.invx.checked; saveUiPrefs(); });
   ui.swapax.addEventListener("change", () => { swapAxes = ui.swapax.checked; saveUiPrefs(); });
+  ui.invl.addEventListener("change", () => {
+    if (!connected) {
+      setStatus("Erst BLE verbinden", "warn");
+      ui.invl.checked = !ui.invl.checked;
+      return;
+    }
+    const on = ui.invl.checked ? 1 : 0;
+    bleWrite("il," + on);
+    setStatus(on ? "Linker Motor umkehren: an" : "Linker Motor umkehren: aus", "on");
+  });
   let sensTimer = null;
   ui.sens.addEventListener("input", () => {
     ui.sensv.textContent = ui.sens.value;
