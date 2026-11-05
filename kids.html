@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <title>Rastix Kids</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      margin: 0; height: 100%; overflow: hidden;
+      background: #0b1220; color: #fff;
+      font-family: system-ui, sans-serif;
+      user-select: none; touch-action: none;
+    }
+    #cam {
+      display: none; position: fixed; inset: 0; width: 100%; height: 100%;
+      object-fit: cover; z-index: 0; background: #000;
+    }
+    body.cam-on { background: transparent; }
+    body.cam-on #cam { display: block; }
+    body.cam-on .page { background: transparent; }
+    body.cam-on .controls {
+      background: rgba(11, 18, 32, 0.55);
+      backdrop-filter: blur(6px);
+      border-radius: 14px; padding: 8px;
+    }
+    body.cam-on canvas {
+      background: rgba(17, 24, 39, 0.35);
+      box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.45);
+    }
+    .page {
+      position: relative; z-index: 1;
+      height: 100%; width: 100%; padding: 10px;
+      margin: 0 auto;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .controls {
+      display: flex; flex-direction: column; gap: 8px; flex-shrink: 0;
+    }
+    h1 { margin: 0; font-size: 1.2rem; text-align: center; }
+    .devnum {
+      text-align: center; font-size: clamp(2.8rem, 14vw, 4.5rem);
+      font-weight: 900; line-height: 1; letter-spacing: -0.02em;
+      color: #38bdf8; min-height: 1.1em;
+    }
+    .devnum.empty { color: #475569; font-size: clamp(1.4rem, 6vw, 2rem); font-weight: 700; }
+    .ble, .tilt, .orient, .cam {
+      width: 100%; border: 0; border-radius: 14px;
+      font-weight: 800; color: #fff;
+    }
+    .ble { padding: 14px 12px; font-size: 17px; background: #7c3aed; }
+    .ble.off { background: #c62828; }
+    .tilt { padding: 18px 12px; font-size: 20px; background: #455a64; }
+    .tilt.on { background: #00897b; }
+    .orient { padding: 12px; font-size: 15px; background: #334155; }
+    .orient.on { background: #0369a1; }
+    .cam { padding: 12px; font-size: 15px; background: #0f766e; }
+    .cam.on { background: #b45309; }
+    .pad-wrap {
+      flex: 1 1 auto; min-height: 0; min-width: 0;
+      display: flex; justify-content: center; align-items: center;
+    }
+    canvas {
+      background: #111827; border-radius: 50%;
+      box-shadow: 0 0 0 3px #334155, 0 10px 28px rgba(0,0,0,.45);
+      touch-action: none;
+      display: block;
+    }
+    .hint {
+      text-align: center; font-size: 12px; color: #94a3b8; line-height: 1.3;
+    }
+
+    /* Querformat: schmale Button-Leiste, Kreis maximal */
+    body.is-landscape .page {
+      flex-direction: row; align-items: stretch; gap: 8px; padding: 8px;
+      max-width: none;
+    }
+    body.is-landscape .controls {
+      width: min(28vw, 180px);
+      justify-content: center; gap: 6px;
+    }
+    body.is-landscape h1 { font-size: 0.95rem; }
+    body.is-landscape .devnum { font-size: clamp(2rem, 12vh, 3.2rem); }
+    body.is-landscape .devnum.empty { font-size: 1rem; }
+    body.is-landscape .ble,
+    body.is-landscape .tilt,
+    body.is-landscape .orient,
+    body.is-landscape .cam {
+      padding: 8px 8px; font-size: 12px; border-radius: 10px; line-height: 1.2;
+    }
+    body.is-landscape .tilt { font-size: 13px; padding: 10px 8px; }
+    body.is-landscape .hint { font-size: 10px; }
+  </style>
+</head>
+<body>
+<script>
+(function () {
+  const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+  const NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+  const PAD_DEAD = 0.12;
+  const SEND_MS = 100;
+  const MAX_TILT = 28;
+  const DEADZONE = 5;
+  const OUT_SMOOTH = 0.2;
+  const OUT_SMOOTH_STOP = 0.45;
+
+  let device = null;
+  let rxChar = null;
+  let connected = false;
+  let tiltEnabled = false;
+  let landscape = false;
+  let touchActive = false;
+  let calibrateNext = false;
+  let filtG = { x: null, y: null, z: null };
+  let calBasis = null; // { down, right, forward } — Neutral aus Schwerkraft
+  let gravHits = 0;
+  let filtOut = { speed: 0, steering: 0 };
+  let lastPad = { x: 0, y: 0, down: false };
+  let speed = 0;
+  let steering = 0;
+  let lastSent = { speed: 0, steering: 0, t: 0 };
+  let heartbeat = null;
+  let encoder = new TextEncoder();
+  let writeQueue = Promise.resolve();
+  let pendingDrive = null;
+  let camStream = null;
+
+  if (!navigator.bluetooth) {
+    document.body.innerHTML =
+      '<div style="padding:1.2rem;font-family:system-ui;line-height:1.45">' +
+      "<h1>Bluetooth fehlt</h1>" +
+      "<p>Bitte <b>Chrome</b> am Handy nutzen und die Seite über <b>HTTPS</b> öffnen.</p></div>";
+    return;
+  }
+
+  document.body.innerHTML =
+    '<video id="cam" playsinline autoplay muted></video>' +
+    '<div class="page">' +
+    '<div class="controls">' +
+    "<h1>Rastix Kids</h1>" +
+    '<div class="devnum empty" id="devnum">—</div>' +
+    '<button class="ble" id="ble" type="button">Verbinden</button>' +
+    '<button class="tilt" id="tilt" type="button">Kippen: Aus</button>' +
+    '<button class="orient" id="orient" type="button">Lage: Hochkant</button>' +
+    '<button class="cam" id="cambtn" type="button">Kamera: Aus</button>' +
+    '<div class="hint" id="hint">Finger auf den Kreis — loslassen = Stopp</div>' +
+    "</div>" +
+    '<div class="pad-wrap" id="padwrap"><canvas id="pad" width="320" height="320"></canvas></div>' +
+    "</div>";
+
+  const ui = {
+    ble: document.getElementById("ble"),
+    tilt: document.getElementById("tilt"),
+    orient: document.getElementById("orient"),
+    cambtn: document.getElementById("cambtn"),
+    cam: document.getElementById("cam"),
+    pad: document.getElementById("pad"),
+    padwrap: document.getElementById("padwrap"),
+    hint: document.getElementById("hint"),
+    devnum: document.getElementById("devnum"),
+  };
+
+  function deviceNumberFromName(name) {
+    const m = String(name || "").match(/(\d)\D*$/);
+    return m ? m[1] : null;
+  }
+
+  function updateDeviceNumber(name) {
+    const n = deviceNumberFromName(name);
+    if (n == null) {
+      ui.devnum.textContent = "—";
+      ui.devnum.classList.add("empty");
+      return;
+    }
+    ui.devnum.textContent = n;
+    ui.devnum.classList.remove("empty");
+  }
+
+  function resizePad() {
+    const wrap = ui.padwrap;
+    if (!wrap) return;
+    const s = Math.max(80, Math.floor(Math.min(wrap.clientWidth, wrap.clientHeight)));
+    ui.pad.style.width = s + "px";
+    ui.pad.style.height = s + "px";
+    // interne Auflösung hoch genug halten
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const px = Math.round(s * dpr);
+    if (ui.pad.width !== px) {
+      ui.pad.width = px;
+      ui.pad.height = px;
+    }
+    // Letzte Position behalten — sonst springt der Punkt bei Resize/Lagewechsel auf Mitte
+    drawPad(ui.pad.getContext("2d"), lastPad.x, lastPad.y, lastPad.down);
+  }
+
+  function vDot(a, b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+  function vCross(a, b) {
+    return {
+      x: a.y * b.z - a.z * b.y,
+      y: a.z * b.x - a.x * b.z,
+      z: a.x * b.y - a.y * b.x,
+    };
+  }
+  function vNorm(x, y, z) {
+    const n = Math.hypot(x, y, z);
+    if (n < 1e-6) return null;
+    return { x: x / n, y: y / n, z: z / n };
+  }
+
+  /** Orthonormales Gerätelagen-Basisystem aus Schwerkraft (kein Euler → keine 90°-Sprünge). */
+  function buildCalBasis(down) {
+    // Geräte-X in die Ebene senkrecht zu „unten“ projizieren = Rechtsachse
+    let right = vNorm(
+      1 - down.x * down.x,
+      -down.x * down.y,
+      -down.x * down.z
+    );
+    if (!right) {
+      right = vNorm(
+        -down.z * down.x,
+        -down.z * down.y,
+        1 - down.z * down.z
+      );
+    }
+    if (!right) right = { x: 1, y: 0, z: 0 };
+    const f = vCross(down, right);
+    const forward = vNorm(f.x, f.y, f.z) || f;
+    return { down: { x: down.x, y: down.y, z: down.z }, right, forward };
+  }
+
+  /** Beta/Gamma → genäherter Schwerkraftvektor (Fallback ohne DeviceMotion). */
+  function gravityFromEuler(beta, gamma) {
+    const b = (beta * Math.PI) / 180;
+    const g = (gamma * Math.PI) / 180;
+    const cg = Math.cos(g);
+    return vNorm(Math.sin(g), -cg * Math.sin(b), -cg * Math.cos(b));
+  }
+
+  function updateBleButton() {
+    if (connected) {
+      ui.ble.textContent = "Trennen";
+      ui.ble.classList.add("off");
+    } else {
+      ui.ble.textContent = "Verbinden";
+      ui.ble.classList.remove("off");
+    }
+  }
+
+  function updateTiltButton() {
+    ui.tilt.textContent = tiltEnabled ? "Kippen: An" : "Kippen: Aus";
+    ui.tilt.classList.toggle("on", tiltEnabled);
+  }
+
+  function updateOrientButton() {
+    ui.orient.textContent = landscape ? "Lage: Quer" : "Lage: Hochkant";
+    ui.orient.classList.toggle("on", landscape);
+    document.body.classList.toggle("is-landscape", landscape);
+    requestAnimationFrame(resizePad);
+  }
+
+  function updateHint() {
+    if (!connected) {
+      ui.hint.textContent = "Zuerst Bluetooth verbinden";
+      return;
+    }
+    if (tiltEnabled) {
+      ui.hint.textContent = landscape
+        ? "Quer — Handy kippen (Neutral halten zum Kalibrieren)"
+        : "Hochkant — Handy kippen (Neutral halten zum Kalibrieren)";
+      return;
+    }
+    ui.hint.textContent = "Finger auf den Kreis — loslassen = Stopp";
+  }
+
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  async function bleWrite(line) {
+    if (!rxChar) return;
+    writeQueue = writeQueue.then(async () => {
+      if (!rxChar) return;
+      const data = encoder.encode(line + "\n");
+      try {
+        await rxChar.writeValueWithoutResponse(data);
+      } catch (e) {
+        try { await rxChar.writeValue(data); } catch (_) {}
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }).catch(() => {});
+    return writeQueue;
+  }
+
+  function bleWriteDrive(spd, str) {
+    pendingDrive = spd + "," + str;
+    writeQueue = writeQueue.then(async () => {
+      if (!rxChar || pendingDrive == null) return;
+      const line = pendingDrive;
+      pendingDrive = null;
+      const data = encoder.encode(line + "\n");
+      try {
+        await rxChar.writeValueWithoutResponse(data);
+      } catch (e) {
+        try { await rxChar.writeValue(data); } catch (_) {}
+      }
+      await new Promise((r) => setTimeout(r, 25));
+      if (pendingDrive != null) {
+        const again = pendingDrive;
+        pendingDrive = null;
+        const d2 = encoder.encode(again + "\n");
+        try {
+          await rxChar.writeValueWithoutResponse(d2);
+        } catch (e) {
+          try { await rxChar.writeValue(d2); } catch (_) {}
+        }
+      }
+    }).catch(() => {});
+  }
+
+  function apply(nextSpeed, nextSteering) {
+    speed = Math.round(clamp(nextSpeed, -100, 100));
+    steering = Math.round(clamp(nextSteering, -100, 100));
+    send(false);
+  }
+
+  function send(force) {
+    if (!connected) return;
+    const now = Date.now();
+    if (!force &&
+        speed === lastSent.speed &&
+        steering === lastSent.steering &&
+        now - lastSent.t < SEND_MS) return;
+    lastSent = { speed, steering, t: now };
+    bleWriteDrive(speed, steering);
+  }
+
+  function startHeartbeat() {
+    stopHeartbeat();
+    heartbeat = setInterval(() => {
+      if (!connected) return;
+      if (Date.now() - lastSent.t < 700) return;
+      bleWrite("k");
+    }, 800);
+  }
+
+  function stopHeartbeat() {
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = null;
+  }
+
+  async function onConnected() {
+    connected = true;
+    updateBleButton();
+    updateDeviceNumber(device && device.name);
+    updateHint();
+    // Nur Handy-Modus an — Max-Speed / Lenkung bleiben wie von der Eltern-UI am ESP gespeichert
+    await bleWrite("h,1");
+    startHeartbeat();
+  }
+
+  function stopMotors() {
+    speed = 0;
+    steering = 0;
+    filtOut = { speed: 0, steering: 0 };
+    apply(0, 0);
+    drawPad(ui.pad.getContext("2d"), 0, 0, false);
+  }
+
+  function cleanupBle() {
+    stopTilt(false);
+    stopHeartbeat();
+    if (connected && rxChar) {
+      try { bleWrite("stop"); } catch (_) {}
+    }
+    connected = false;
+    rxChar = null;
+    if (device && device.gatt && device.gatt.connected) {
+      try { device.gatt.disconnect(); } catch (_) {}
+    }
+    device = null;
+    stopMotors();
+    updateBleButton();
+    updateDeviceNumber(null);
+    updateHint();
+  }
+
+  async function attachDevice(dev) {
+    device = dev;
+    device.addEventListener("gattserverdisconnected", () => {
+      cleanupBle();
+    });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(NUS_SERVICE);
+    rxChar = await service.getCharacteristic(NUS_RX);
+    await onConnected();
+  }
+
+  async function tryAutoReconnect() {
+    if (!navigator.bluetooth.getDevices) return false;
+    try {
+      const devices = await navigator.bluetooth.getDevices();
+      const hit = devices.find((d) => d.name && /^rastix/i.test(d.name));
+      if (!hit) return false;
+      await attachDevice(hit);
+      return true;
+    } catch (e) {
+      console.warn(e);
+      return false;
+    }
+  }
+
+  async function toggleBle() {
+    if (connected) {
+      cleanupBle();
+      return;
+    }
+    try {
+      const ok = await tryAutoReconnect();
+      if (ok) return;
+      const dev = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: "rastix" }, { services: [NUS_SERVICE] }],
+        optionalServices: [NUS_SERVICE],
+      });
+      await attachDevice(dev);
+    } catch (e) {
+      console.warn(e);
+      cleanupBle();
+    }
+  }
+
+  async function askSensorPermission() {
+    const ask = async (obj) => {
+      if (!obj || typeof obj.requestPermission !== "function") return true;
+      try {
+        return (await obj.requestPermission()) === "granted";
+      } catch (e) {
+        return false;
+      }
+    };
+    const okOrient = await ask(window.DeviceOrientationEvent);
+    const okMotion = await ask(window.DeviceMotionEvent);
+    return okOrient || okMotion;
+  }
+
+  function onMotion(ev) {
+    if (!tiltEnabled || !connected || touchActive) return;
+    const a = ev.accelerationIncludingGravity;
+    if (!a || a.x == null) return;
+    gravHits += 1;
+    useGravity(a.x, a.y, a.z);
+  }
+
+  function onOrient(ev) {
+    // Nur Fallback, wenn keine Schwerkraft-Events kommen (Euler hat 90°-Singularitäten)
+    if (!tiltEnabled || !connected || touchActive) return;
+    if (gravHits > 0) return;
+    if (ev.beta == null || ev.gamma == null) return;
+    const g = gravityFromEuler(ev.beta, ev.gamma);
+    if (g) useGravity(g.x, g.y, g.z);
+  }
+
+  function useGravity(rx, ry, rz) {
+    const raw = vNorm(rx, ry, rz);
+    if (!raw) return;
+
+    if (filtG.x == null) {
+      filtG = { x: raw.x, y: raw.y, z: raw.z };
+    } else {
+      // Starke Einzelstöße (Fallenlassen) ignorieren — keine Euler-Wraps mehr
+      if (Math.hypot(raw.x - filtG.x, raw.y - filtG.y, raw.z - filtG.z) > 0.6) return;
+      const k = 0.22;
+      filtG.x += k * (raw.x - filtG.x);
+      filtG.y += k * (raw.y - filtG.y);
+      filtG.z += k * (raw.z - filtG.z);
+      const n = Math.hypot(filtG.x, filtG.y, filtG.z) || 1;
+      filtG.x /= n;
+      filtG.y /= n;
+      filtG.z /= n;
+    }
+
+    if (calibrateNext || !calBasis) {
+      calBasis = buildCalBasis(filtG);
+      calibrateNext = false;
+      filtOut = { speed: 0, steering: 0 };
+      apply(0, 0);
+      return;
+    }
+
+    // Winkel relativ zur Startlage (waagrecht/hochkant egal)
+    let dRoll = (Math.atan2(vDot(filtG, calBasis.right), vDot(filtG, calBasis.down)) * 180) / Math.PI;
+    let dPitch = (Math.atan2(vDot(filtG, calBasis.forward), vDot(filtG, calBasis.down)) * 180) / Math.PI;
+
+    if (landscape) {
+      const t = dPitch;
+      dPitch = -dRoll;
+      dRoll = t;
+      // Nach Achsentausch Vor/Zurück für Quer korrigieren
+      dPitch = -dPitch;
+    }
+    dPitch = clamp(dPitch, -MAX_TILT, MAX_TILT);
+    dRoll = clamp(dRoll, -MAX_TILT, MAX_TILT);
+
+    const magP = Math.abs(dPitch);
+    const magR = Math.abs(dRoll);
+    let targetSpd = 0;
+    let targetStr = 0;
+    if (magP >= DEADZONE) {
+      const val = ((magP - DEADZONE) / (MAX_TILT - DEADZONE)) * 100;
+      targetSpd = dPitch >= 0 ? -val : val;
+    }
+    if (magR >= DEADZONE) {
+      targetStr = ((dRoll > 0 ? 1 : -1) *
+        ((magR - DEADZONE) / (MAX_TILT - DEADZONE)) * 100);
+    }
+
+    const towardZero = Math.abs(targetSpd) < Math.abs(filtOut.speed);
+    const kSpd = towardZero ? OUT_SMOOTH_STOP : OUT_SMOOTH;
+    filtOut.speed += kSpd * (targetSpd - filtOut.speed);
+    filtOut.steering += OUT_SMOOTH * (targetStr - filtOut.steering);
+    if (targetSpd === 0) filtOut.speed = 0;
+    if (targetStr === 0 && Math.abs(filtOut.steering) < 4) filtOut.steering = 0;
+
+    const sx = clamp(filtOut.steering / 100, -1, 1);
+    const sy = clamp(-filtOut.speed / 100, -1, 1);
+    drawPad(ui.pad.getContext("2d"), sx, sy, Math.abs(filtOut.speed) + Math.abs(filtOut.steering) > 3);
+    apply(filtOut.speed, filtOut.steering);
+  }
+
+  function stopTilt(updateUi) {
+    tiltEnabled = false;
+    window.removeEventListener("deviceorientation", onOrient, true);
+    window.removeEventListener("devicemotion", onMotion, true);
+    filtG = { x: null, y: null, z: null };
+    calBasis = null;
+    gravHits = 0;
+    if (updateUi !== false) {
+      updateTiltButton();
+      updateHint();
+      stopMotors();
+    }
+  }
+
+  async function toggleTilt() {
+    if (tiltEnabled) {
+      stopTilt(true);
+      return;
+    }
+    if (!connected) return;
+    if (!window.isSecureContext) {
+      ui.hint.textContent = "Kippen braucht HTTPS";
+      return;
+    }
+    const ok = await askSensorPermission();
+    if (!ok) {
+      ui.hint.textContent = "Sensor-Erlaubnis fehlt (Schloss → Bewegungssensoren)";
+      return;
+    }
+    tiltEnabled = true;
+    calibrateNext = true;
+    filtG = { x: null, y: null, z: null };
+    calBasis = null;
+    gravHits = 0;
+    filtOut = { speed: 0, steering: 0 };
+    window.addEventListener("devicemotion", onMotion, true);
+    window.addEventListener("deviceorientation", onOrient, true);
+    updateTiltButton();
+    updateHint();
+  }
+
+  async function lockScreenOrientation(wantLandscape) {
+    // Automatische Handy-Drehung abschalten (braucht oft Vollbild + User-Geste)
+    try {
+      const el = document.documentElement;
+      if (!document.fullscreenElement && el.requestFullscreen) {
+        await el.requestFullscreen({ navigationUI: "hide" }).catch(() =>
+          el.requestFullscreen()
+        );
+      }
+    } catch (_) {}
+    try {
+      if (screen.orientation && screen.orientation.lock) {
+        await screen.orientation.lock(wantLandscape ? "landscape" : "portrait");
+        return true;
+      }
+    } catch (e) {
+      console.warn("orientation.lock", e);
+    }
+    // Fallback: ältere WebKit-API
+    try {
+      const so = screen;
+      if (wantLandscape && so.lockOrientation)
+        return !!so.lockOrientation("landscape");
+      if (!wantLandscape && so.lockOrientation)
+        return !!so.lockOrientation("portrait");
+      if (wantLandscape && so.mozLockOrientation)
+        return !!so.mozLockOrientation("landscape");
+      if (!wantLandscape && so.mozLockOrientation)
+        return !!so.mozLockOrientation("portrait");
+    } catch (_) {}
+    return false;
+  }
+
+  async function toggleOrient() {
+    landscape = !landscape;
+    updateOrientButton();
+    updateHint();
+    calibrateNext = true;
+    calBasis = null;
+    filtOut = { speed: 0, steering: 0 };
+    if (connected) apply(0, 0);
+    const ok = await lockScreenOrientation(landscape);
+    if (!ok) {
+      ui.hint.textContent = landscape
+        ? "Quer aktiv — Auto-Drehung ggf. in Handy-Einstellungen sperren"
+        : "Hochkant aktiv — Auto-Drehung ggf. in Handy-Einstellungen sperren";
+    } else {
+      updateHint();
+    }
+  }
+
+  function stopCamera() {
+    if (camStream) {
+      camStream.getTracks().forEach((t) => t.stop());
+      camStream = null;
+    }
+    if (ui.cam) ui.cam.srcObject = null;
+    document.body.classList.remove("cam-on");
+    if (ui.cambtn) {
+      ui.cambtn.textContent = "Kamera: Aus";
+      ui.cambtn.classList.remove("on");
+    }
+  }
+
+  async function toggleCamera() {
+    if (camStream) {
+      stopCamera();
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      ui.hint.textContent = "Kamera nicht verfügbar";
+      return;
+    }
+    try {
+      camStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+      });
+      ui.cam.srcObject = camStream;
+      document.body.classList.add("cam-on");
+      ui.cambtn.textContent = "Kamera: An";
+      ui.cambtn.classList.add("on");
+      requestAnimationFrame(resizePad);
+    } catch (e) {
+      console.warn(e);
+      stopCamera();
+      ui.hint.textContent = "Kamera-Erlaubnis fehlt oder keine Rückkamera";
+    }
+  }
+
+  function setupPad(canvas) {
+    const ctx = canvas.getContext("2d");
+    const toLocal = (ev) => {
+      const r = canvas.getBoundingClientRect();
+      const t = ev.touches ? ev.touches[0] : ev;
+      const x = ((t.clientX - r.left) / r.width) * 2 - 1;
+      const y = ((t.clientY - r.top) / r.height) * 2 - 1;
+      return { x: clamp(x, -1, 1), y: clamp(y, -1, 1) };
+    };
+    const handle = (ev) => {
+      ev.preventDefault();
+      if (!connected || tiltEnabled) return;
+      touchActive = true;
+      const p = toLocal(ev);
+      let nx = p.x, ny = -p.y;
+      if (landscape) {
+        // Quer: Achsen tauschen (wie rastix_ble.html)
+        const t = nx;
+        nx = ny;
+        ny = t;
+      }
+      let sx = nx, sy = ny;
+      if (Math.hypot(sx, sy) < PAD_DEAD) { sx = 0; sy = 0; }
+      drawPad(ctx, p.x, p.y, true);
+      apply(sy * 100, sx * 100);
+    };
+    const end = (ev) => {
+      ev.preventDefault();
+      touchActive = false;
+      if (tiltEnabled) return;
+      drawPad(ctx, 0, 0, false);
+      if (connected) apply(0, 0);
+    };
+    canvas.addEventListener("touchstart", handle, { passive: false });
+    canvas.addEventListener("touchmove", handle, { passive: false });
+    canvas.addEventListener("touchend", end, { passive: false });
+    canvas.addEventListener("touchcancel", end, { passive: false });
+    canvas.addEventListener("mousedown", (ev) => {
+      handle(ev);
+      const move = (e) => handle(e);
+      const up = (e) => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        end(e);
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+    });
+  }
+
+  function drawPad(ctx, x, y, down) {
+    const w = ctx.canvas.width, h = ctx.canvas.height, cx = w / 2, cy = h / 2;
+    const ringR = Math.min(cx, cy) - 8;
+    const knobR = down ? 36 : 30;
+    // Kreis begrenzen: Knopfmitte max. bis zum Innenrand des äußeren Kreises
+    let dx = x, dy = y;
+    const mag = Math.hypot(dx, dy);
+    if (mag > 1) {
+      dx /= mag;
+      dy /= mag;
+    }
+    const maxTravel = Math.max(0, ringR - knobR - 3);
+    lastPad = { x: dx, y: dy, down: !!down };
+    ctx.clearRect(0, 0, w, h);
+    ctx.beginPath();
+    ctx.arc(cx, cy, ringR, 0, Math.PI * 2);
+    ctx.strokeStyle = "#475569";
+    ctx.lineWidth = 6;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx, cy, 18, 0, Math.PI * 2);
+    ctx.fillStyle = "#64748b";
+    ctx.fill();
+    const px = cx + dx * maxTravel;
+    const py = cy + dy * maxTravel;
+    ctx.beginPath();
+    ctx.arc(px, py, knobR, 0, Math.PI * 2);
+    ctx.fillStyle = down ? "#22c55e" : "#38bdf8";
+    ctx.fill();
+  }
+
+  ui.ble.addEventListener("click", () => toggleBle());
+  ui.tilt.addEventListener("click", () => toggleTilt());
+  ui.orient.addEventListener("click", () => toggleOrient());
+  ui.cambtn.addEventListener("click", () => toggleCamera());
+  setupPad(ui.pad);
+  updateBleButton();
+  updateTiltButton();
+  updateOrientButton();
+  updateHint();
+  resizePad();
+  window.addEventListener("resize", resizePad);
+  if (screen.orientation) {
+    screen.orientation.addEventListener("change", () => requestAnimationFrame(resizePad));
+  }
+
+  (async () => {
+    await tryAutoReconnect();
+    updateHint();
+    resizePad();
+  })();
+
+  // Nach erstem Tippen irgendwo: Hochkant sperren, falls noch nicht gesetzt
+  document.body.addEventListener("click", function onceLock() {
+    document.body.removeEventListener("click", onceLock);
+    if (!landscape) lockScreenOrientation(false);
+  }, { capture: true });
+
+  window.addEventListener("pagehide", () => {
+    if (connected) bleWrite("stop");
+    stopCamera();
+  });
+})();
+</script>
+</body>
+</html>

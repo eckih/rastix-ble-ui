@@ -4,9 +4,10 @@ Browser-Steuerung für Rastix (ESPHome) per Web Bluetooth.
 
 ## Öffentlich
 
-**https://eckih.github.io/rastix-ble-ui/**
+**Eltern-UI:** https://eckih.github.io/rastix-ble-ui/  
+**Kids-UI:** https://eckih.github.io/rastix-ble-ui/kids.html
 
-Handy und ESP im Bluetooth-Reichweite; Seite per HTTPS öffnen, **BLE verbinden**, Gerät `rastix-…` wählen.
+Handy und ESP in Bluetooth-Reichweite; Seite per HTTPS öffnen, **BLE verbinden**, Gerät `rastix-…` wählen.
 
 ## Lokal
 
