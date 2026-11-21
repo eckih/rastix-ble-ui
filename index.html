@@ -584,10 +584,25 @@
     return true;
   }
 
+  function applyPedalTelemetry(text) {
+    const t = String(text || "").trim();
+    if (t.indexOf("ped,") !== 0) return false;
+    const pct = Number(t.slice(4));
+    if (Number.isNaN(pct)) return false;
+    const p = Math.max(0, Math.min(100, Math.round(pct)));
+    // Gasbalken = Pedal, solange die App nicht selbst fährt
+    if (!active) {
+      ui.spd.style.width = p + "%";
+      ui.spdt.textContent = String(p);
+    }
+    return true;
+  }
+
   function onBleNotify(ev) {
     try {
       const text = new TextDecoder("utf-8").decode(ev.target.value);
       if (applyEspConfig(text)) return;
+      if (applyPedalTelemetry(text)) return;
       console.log("BLE TX:", text);
     } catch (e) {
       console.warn(e);
