@@ -1046,10 +1046,6 @@
       clearTimeout(t);
       t = setTimeout(() => {
         const pin = getPin();
-        if (pin == null) {
-          setStatus("Warte auf Pin-Config vom ESP (nochmals verbinden)", "warn");
-          return;
-        }
         if (active) haltDrive(true);
         bleWrite("p" + pin + "," + input.value);
         setStatus("PWM GPIO" + pin + " " + input.value + "%");
