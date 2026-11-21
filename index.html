@@ -277,8 +277,24 @@
     const p = Math.max(0, Math.min(100, Math.round(Number(pct) || 0)));
     lastPedalPct = p;
     if (active) return;
-    ui.spd.style.width = p + "%";
-    ui.spdt.textContent = String(p);
+    if (ui.spd) ui.spd.style.width = p + "%";
+    if (ui.spdt) ui.spdt.textContent = String(p);
+    if (ui.dbg) ui.dbg.textContent = "Pedal " + p + "%";
+  }
+
+  let pedalPoll = null;
+  function startPedalPoll() {
+    stopPedalPoll();
+    pedalPoll = setInterval(() => {
+      if (!connected || active || !rxChar) return;
+      bleWrite("e");
+    }, 400);
+  }
+  function stopPedalPoll() {
+    if (pedalPoll) {
+      clearInterval(pedalPoll);
+      pedalPoll = null;
+    }
   }
 
   let sensorHits = 0, gotOrient = false, tiltReady = false, sensorWatch = null;
@@ -540,8 +556,14 @@
       await bleWrite("g");
       // Handy-Modus erst bei Start — sonst bleibt Gaspedal nutzbar
       await bleWrite("h,0");
+      await bleWrite("e");
+      startPedalPoll();
       // ESP sendet cfg auch on_connect (~500ms) — nochmals anfordern
-      setTimeout(() => { if (connected) bleWrite("g"); }, 800);
+      setTimeout(() => {
+        if (!connected) return;
+        bleWrite("g");
+        bleWrite("e");
+      }, 800);
     } catch (e) {
       console.warn(e);
       cleanupBle();
@@ -599,8 +621,11 @@
 
   function applyPedalTelemetry(text) {
     const t = String(text || "").trim();
-    if (t.indexOf("ped,") !== 0) return false;
-    const pct = Number(t.slice(4));
+    // "ped,42" oder irgendwo im Text
+    let m = t.match(/(?:^|,)ped,(-?\d+)/i) || t.match(/^ped,(-?\d+)/i);
+    if (!m && t.indexOf("ped,") === 0) m = [null, t.slice(4)];
+    if (!m) return false;
+    const pct = Number(m[1]);
     if (Number.isNaN(pct)) return false;
     showPedalOnGasBar(pct);
     return true;
@@ -608,9 +633,11 @@
 
   function onBleNotify(ev) {
     try {
-      const text = new TextDecoder("utf-8").decode(ev.target.value);
+      const raw = ev.target.value;
+      const text = new TextDecoder("utf-8").decode(raw);
       if (applyEspConfig(text)) return;
       if (applyPedalTelemetry(text)) return;
+      // Fallback: reine Zahl als Pedal? nein
       console.log("BLE TX:", text);
     } catch (e) {
       console.warn(e);
@@ -619,6 +646,7 @@
 
   function cleanupBle() {
     if (active) haltDrive(true);
+    stopPedalPoll();
     if (txChar) {
       try {
         txChar.removeEventListener("characteristicvaluechanged", onBleNotify);
@@ -698,6 +726,7 @@
     lastSent = { speed: 0, steering: 0, t: 0 };
     ui.btn.textContent = "Stopp";
     ui.btn.classList.add("stop");
+    stopPedalPoll();
     await bleWrite("h,1");
     document.addEventListener("visibilitychange", onVis);
     heartbeat = setInterval(() => {
@@ -728,6 +757,10 @@
     drawPad(ui.pad.getContext("2d"), 0, 0, false);
     // stop → Handy-Modus aus → Gaspedal wieder aktiv
     if (!skipCmd && connected) bleWrite("stop");
+    if (connected) {
+      bleWrite("e");
+      startPedalPoll();
+    }
   }
 
   function stop(reason) {
