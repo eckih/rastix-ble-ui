@@ -260,17 +260,26 @@
     pwmLlab: document.getElementById("pwmLlab"),
   };
 
-  // PWM-Pins vom ESP (cfg pr=/pl=) — keine falschen Defaults anzeigen
-  let pwmPinR = null;
-  let pwmPinL = null;
+  // PWM-Pins: Defaults wie rastix-v1-3 (cfg pr=/pl= überschreibt)
+  let pwmPinR = 26;
+  let pwmPinL = 32;
+  let lastPedalPct = 0;
 
   function setPwmPinLabels() {
     if (ui.pwmRlab)
-      ui.pwmRlab.textContent = pwmPinR != null ? ("PWM R GPIO" + pwmPinR) : "PWM R (warte auf ESP)";
+      ui.pwmRlab.textContent = "PWM R GPIO" + pwmPinR;
     if (ui.pwmLlab)
-      ui.pwmLlab.textContent = pwmPinL != null ? ("PWM L GPIO" + pwmPinL) : "PWM L (warte auf ESP)";
+      ui.pwmLlab.textContent = "PWM L GPIO" + pwmPinL;
   }
   setPwmPinLabels();
+
+  function showPedalOnGasBar(pct) {
+    const p = Math.max(0, Math.min(100, Math.round(Number(pct) || 0)));
+    lastPedalPct = p;
+    if (active) return;
+    ui.spd.style.width = p + "%";
+    ui.spdt.textContent = String(p);
+  }
 
   let sensorHits = 0, gotOrient = false, tiltReady = false, sensorWatch = null;
   let sensorAlive = false;
@@ -567,6 +576,9 @@
         ui.bal.value = val;
         ui.balv.textContent = String(val);
         msg.push("Balance " + val + "%");
+      } else if (key === "ped") {
+        showPedalOnGasBar(val);
+        msg.push("Pedal " + Math.round(val) + "%");
       } else if (key === "pr") {
         pwmPinR = Math.round(val);
         setPwmPinLabels();
@@ -590,12 +602,7 @@
     if (t.indexOf("ped,") !== 0) return false;
     const pct = Number(t.slice(4));
     if (Number.isNaN(pct)) return false;
-    const p = Math.max(0, Math.min(100, Math.round(pct)));
-    // Gasbalken = Pedal, solange die App nicht selbst fährt
-    if (!active) {
-      ui.spd.style.width = p + "%";
-      ui.spdt.textContent = String(p);
-    }
+    showPedalOnGasBar(pct);
     return true;
   }
 
@@ -625,6 +632,12 @@
   }
 
   function updateBars() {
+    if (!active) {
+      showPedalOnGasBar(lastPedalPct);
+      ui.str.style.left = "50%";
+      ui.strt.textContent = "0";
+      return;
+    }
     ui.spd.style.width = Math.abs(speed) + "%";
     ui.spdt.textContent = String(speed);
     ui.str.style.left = ((steering + 100) / 2) + "%";
