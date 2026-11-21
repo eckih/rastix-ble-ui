@@ -97,6 +97,7 @@
   let writeQueue = Promise.resolve();
   let pendingDrive = null;
   let maxSpdTimer = null;
+  let balTimer = null;
   let filtG = { x: null, y: null, z: null };
   let calBasis = null;
   let gravHits = 0;
@@ -214,6 +215,10 @@
         <div>Lenk-Empfindlichkeit: <span id="sensv">10</span>%</div>
         <input type="range" id="sens" min="0" max="100" step="0.5" value="10" disabled>
       </div>
+      <div class="sens">
+        <div>Motor-Balance L←→R: <span id="balv">0</span>%</div>
+        <input type="range" id="bal" min="-50" max="50" step="1" value="0" disabled>
+      </div>
       <div class="dbg" id="dbg">Sensor: —</div>
       <div class="test">
         <div class="sens"><div><span id="pwmRlab">PWM R</span>: <span id="g14v">0</span>%</div>
@@ -244,6 +249,8 @@
     sensv: document.getElementById("sensv"),
     maxspd: document.getElementById("maxspd"),
     maxv: document.getElementById("maxv"),
+    bal: document.getElementById("bal"),
+    balv: document.getElementById("balv"),
     dbg: document.getElementById("dbg"),
     g14: document.getElementById("g14"),
     g14v: document.getElementById("g14v"),
@@ -434,6 +441,7 @@
     ui.g13.disabled = !on;
     ui.sens.disabled = !on;
     ui.maxspd.disabled = !on;
+    if (ui.bal) ui.bal.disabled = !on;
     ui.ble.textContent = on ? "BLE trennen" : "BLE verbinden";
   }
 
@@ -554,6 +562,10 @@
         ui.sens.value = val;
         ui.sensv.textContent = String(val);
         msg.push("Lenk " + val + "%");
+      } else if (key === "b" && ui.bal && !skipMf) {
+        ui.bal.value = val;
+        ui.balv.textContent = String(val);
+        msg.push("Balance " + val + "%");
       } else if (key === "pr") {
         pwmPinR = Math.round(val);
         setPwmPinLabels();
@@ -978,6 +990,23 @@
     clearTimeout(maxSpdTimer);
     bleWrite("m," + ui.maxspd.value);
     setStatus("Max-Speed senden: " + ui.maxspd.value + "%");
+  });
+  ui.bal.addEventListener("input", () => {
+    ui.balv.textContent = ui.bal.value;
+    ignoreCfgUntil = Date.now() + 2000;
+    clearTimeout(balTimer);
+    balTimer = setTimeout(() => {
+      ignoreCfgUntil = Date.now() + 2000;
+      bleWrite("b," + ui.bal.value);
+      setStatus("Motor-Balance senden: " + ui.bal.value + "%");
+    }, 120);
+  });
+  ui.bal.addEventListener("change", () => {
+    ui.balv.textContent = ui.bal.value;
+    ignoreCfgUntil = Date.now() + 2000;
+    clearTimeout(balTimer);
+    bleWrite("b," + ui.bal.value);
+    setStatus("Motor-Balance senden: " + ui.bal.value + "%");
   });
 
   function bindPwm(input, label, getPin) {
