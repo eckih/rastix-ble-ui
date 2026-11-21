@@ -527,9 +527,10 @@
         txChar = null;
       }
       setConnected(true);
-      setStatus("BLE verbunden — Config laden…", "on");
+      setStatus("BLE verbunden — Pedal aktiv, Start = App-Steuerung", "on");
       await bleWrite("g");
-      await bleWrite("h,1");
+      // Handy-Modus erst bei Start — sonst bleibt Gaspedal nutzbar
+      await bleWrite("h,0");
       // ESP sendet cfg auch on_connect (~500ms) — nochmals anfordern
       setTimeout(() => { if (connected) bleWrite("g"); }, 800);
     } catch (e) {
@@ -712,6 +713,7 @@
     steering = 0;
     updateBars();
     drawPad(ui.pad.getContext("2d"), 0, 0, false);
+    // stop → Handy-Modus aus → Gaspedal wieder aktiv
     if (!skipCmd && connected) bleWrite("stop");
   }
 
